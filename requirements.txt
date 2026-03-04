@@ -1,0 +1,16 @@
+# AI Research RAG Assistant — Python dependencies
+
+# UI
+streamlit>=1.35.0
+
+# LLM & embeddings
+openai>=1.30.0
+
+# Vector search
+faiss-cpu>=1.8.0
+
+# PDF text extraction
+pypdf>=4.2.0
+
+# Numerical operations (FAISS dependency, usually auto-installed)
+numpy>=1.26.0
