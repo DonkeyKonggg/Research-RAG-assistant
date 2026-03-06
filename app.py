@@ -116,7 +116,19 @@ if ask_button:
                 st.error(str(e))
                 st.stop()
             except Exception as e:
-                st.error(f"Failed to build the index: {e}")
+                err = str(e)
+                if "connect" in err.lower() or "connection" in err.lower() or "network" in err.lower():
+                    st.error(
+                        f"**Connection error while calling the OpenAI API.**\n\n"
+                        f"`{err}`\n\n"
+                        "**Things to check:**\n"
+                        "- Is your machine connected to the internet?\n"
+                        "- Is the OpenAI API key valid and active?\n"
+                        "- Is `api.openai.com` reachable from this network (no firewall/proxy blocking it)?\n"
+                        "- Try: `curl https://api.openai.com` in a terminal to verify."
+                    )
+                else:
+                    st.error(f"Failed to build the index: {e}")
                 st.stop()
 
         with st.spinner("Generating answer…"):

@@ -13,13 +13,15 @@ Core RAG pipeline:
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
 import faiss
+import httpx
 import numpy as np
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APIStatusError
 from pypdf import PdfReader
 
 # ---------------------------------------------------------------------------
@@ -32,6 +34,10 @@ CHUNK_OVERLAP = 100     # overlap between consecutive chunks (in chars)
 TOP_K = 4               # number of retrieved chunks
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
+
+EMBED_BATCH_SIZE = 50   # max chunks per embedding API call
+API_TIMEOUT = 60        # seconds before a single request times out
+MAX_RETRIES = 3         # number of retries on transient errors
 
 CHAR_CHUNK_SIZE = CHUNK_SIZE * 4      # ~2400 chars
 CHAR_CHUNK_OVERLAP = CHUNK_OVERLAP * 4  # ~400 chars
@@ -129,11 +135,48 @@ def split_into_chunks(page_chunks: List[Chunk]) -> List[Chunk]:
 # Embeddings
 # ---------------------------------------------------------------------------
 
+def _embed_batch(texts: List[str], client: OpenAI) -> List[List[float]]:
+    """
+    Embed a single batch of texts with exponential-backoff retries.
+    Raises the last exception if all retries are exhausted.
+    """
+    delay = 2.0
+    last_exc: Exception = RuntimeError("unknown error")
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+            return [item.embedding for item in response.data]
+        except (APIConnectionError, httpx.ConnectError, httpx.TimeoutException) as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES:
+                print(f"  Connection error on attempt {attempt}/{MAX_RETRIES}, retrying in {delay:.0f}s…")
+                time.sleep(delay)
+                delay *= 2
+        except APIStatusError as exc:
+            # 429 rate-limit: back off; other status errors are fatal
+            if exc.status_code == 429 and attempt < MAX_RETRIES:
+                print(f"  Rate limited, retrying in {delay:.0f}s…")
+                time.sleep(delay)
+                delay *= 2
+                last_exc = exc
+            else:
+                raise
+    raise last_exc
+
+
 def embed_texts(texts: List[str], client: OpenAI) -> np.ndarray:
-    """Return a float32 array of shape (n, embedding_dim)."""
-    response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-    vectors = [item.embedding for item in response.data]
-    return np.array(vectors, dtype=np.float32)
+    """
+    Embed *texts* in batches of EMBED_BATCH_SIZE and return a float32
+    array of shape (n, embedding_dim).
+    """
+    all_vectors: List[List[float]] = []
+    for start in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[start : start + EMBED_BATCH_SIZE]
+        batch_num = start // EMBED_BATCH_SIZE + 1
+        total_batches = (len(texts) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
+        print(f"  Embedding batch {batch_num}/{total_batches} ({len(batch)} chunks)…")
+        all_vectors.extend(_embed_batch(batch, client))
+    return np.array(all_vectors, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +233,7 @@ def build_index(papers_dir: Path = PAPERS_DIR) -> tuple[VectorStore, OpenAI]:
             "Please export it before running the app."
         )
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=API_TIMEOUT, max_retries=0)  # retries managed manually
 
     print("Loading PDFs…")
     page_chunks = load_pdfs(papers_dir)

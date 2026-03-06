@@ -12,5 +12,8 @@ faiss-cpu>=1.8.0
 # PDF text extraction
 pypdf>=4.2.0
 
+# HTTP client (transitive dep of openai, pinned for explicit retry handling)
+httpx>=0.27.0
+
 # Numerical operations (FAISS dependency, usually auto-installed)
 numpy>=1.26.0
