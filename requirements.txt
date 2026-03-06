@@ -3,8 +3,11 @@
 # UI
 streamlit>=1.35.0
 
-# LLM & embeddings
+# LLM & embeddings (cloud mode)
 openai>=1.30.0
+
+# Local / offline embeddings
+sentence-transformers>=3.0.0
 
 # Vector search
 faiss-cpu>=1.8.0

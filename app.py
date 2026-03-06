@@ -3,19 +3,32 @@ app.py
 
 Streamlit UI for the AI Research RAG Assistant.
 
+Two modes:
+  - OpenAI (cloud): OpenAI embeddings + GPT-4o-mini answer synthesis
+  - Local  (offline): sentence-transformers embeddings, no LLM required
+
 Run with:
     streamlit run app.py
 """
 
 import os
-import streamlit as st
-
-from rag_pipeline import RAGAnswer, VectorStore, build_index, answer_question
-from openai import OpenAI
 from pathlib import Path
 
+import streamlit as st
+from openai import OpenAI
+
+from rag_pipeline import (
+    RAGAnswer,
+    VectorStore,
+    Embedder,
+    OpenAIEmbedder,
+    LocalEmbedder,
+    build_index,
+    answer_question,
+)
+
 # ---------------------------------------------------------------------------
-# Page configuration
+# Page config
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
@@ -25,30 +38,66 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Session-state helpers (cache the index across re-runs)
+# Cached index builder  (keyed on provider + api_key so switching rebuilds)
 # ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
-def get_index() -> tuple[VectorStore, OpenAI]:
-    """Build (or reload) the FAISS index once per session."""
-    return build_index()
+def get_index(provider: str, api_key: str) -> tuple[VectorStore, Embedder, OpenAI | None]:
+    """
+    Build the FAISS index once per (provider, api_key) combination.
+    Returns (store, embedder, openai_client_or_None).
+    """
+    if provider == "OpenAI (cloud)":
+        if not api_key:
+            raise EnvironmentError(
+                "Please enter your OpenAI API key in the sidebar."
+            )
+        client = OpenAI(api_key=api_key, timeout=60, max_retries=0)
+        embedder: Embedder = OpenAIEmbedder(client)
+        store = build_index(embedder)
+        return store, embedder, client
+
+    else:  # Local / Offline
+        embedder = LocalEmbedder()
+        store = build_index(embedder)
+        return store, embedder, None
 
 
 # ---------------------------------------------------------------------------
-# Sidebar – configuration
+# Sidebar
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
     st.header("Configuration")
 
-    api_key_input = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        placeholder="sk-…",
-        help="Your key is never stored. It is only used for this session.",
+    provider = st.radio(
+        "Embedding & LLM provider",
+        ["OpenAI (cloud)", "Local / Offline"],
+        help=(
+            "**OpenAI (cloud):** uses text-embedding-3-small + GPT-4o-mini. "
+            "Requires an API key and internet access.\n\n"
+            "**Local / Offline:** uses sentence-transformers all-MiniLM-L6-v2 "
+            "running on your machine. No API key or internet needed after the "
+            "first run (model ~90 MB, downloaded once)."
+        ),
     )
-    if api_key_input:
-        os.environ["OPENAI_API_KEY"] = api_key_input
+
+    api_key_input = ""
+    if provider == "OpenAI (cloud)":
+        api_key_input = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            placeholder="sk-…",
+            help="Used only for this session, never stored.",
+        )
+        if api_key_input:
+            os.environ["OPENAI_API_KEY"] = api_key_input
+    else:
+        st.info(
+            "Running fully offline.\n\n"
+            "Embeddings are computed locally. "
+            "Retrieved passages are shown directly — no LLM synthesis."
+        )
 
     st.markdown("---")
     st.subheader("Papers folder")
@@ -60,11 +109,11 @@ with st.sidebar:
         for f in pdf_files:
             st.caption(f"📄 {f.name}")
     else:
-        st.warning("No PDFs found in `papers/`. Add `.pdf` files and restart the app.")
+        st.warning("No PDFs found in `papers/`. Add `.pdf` files and restart.")
 
     st.markdown("---")
     top_k = st.slider("Retrieved passages (top-k)", min_value=1, max_value=8, value=4)
-    st.caption("How many text chunks are retrieved before the LLM generates an answer.")
+    st.caption("How many text chunks are retrieved before generating an answer.")
 
 
 # ---------------------------------------------------------------------------
@@ -78,9 +127,16 @@ st.markdown(
     "a cited answer using only what it finds."
 )
 
+if provider == "Local / Offline":
+    st.info(
+        "**Local mode active.** "
+        "The top retrieved passages are shown as your answer — "
+        "no LLM synthesis. Switch to *OpenAI (cloud)* in the sidebar for "
+        "generated answers."
+    )
+
 st.markdown("---")
 
-# Question input
 question = st.text_area(
     "Your research question",
     placeholder="e.g. What methods were used to evaluate model performance?",
@@ -99,53 +155,56 @@ if ask_button:
     if not question:
         st.warning("Please enter a question before clicking Ask.")
 
-    elif not os.environ.get("OPENAI_API_KEY"):
-        st.error("Please enter your OpenAI API key in the sidebar first.")
+    elif provider == "OpenAI (cloud)" and not (
+        api_key_input or os.environ.get("OPENAI_API_KEY")
+    ):
+        st.error("Please enter your OpenAI API key in the sidebar.")
 
     elif not pdf_files:
-        st.error("No PDFs found in the `papers/` folder. Please add at least one PDF.")
+        st.error("No PDFs found in `papers/`. Please add at least one PDF.")
 
     else:
-        with st.spinner("Indexing papers and retrieving relevant passages…"):
+        effective_key = api_key_input or os.environ.get("OPENAI_API_KEY", "")
+
+        with st.spinner("Indexing papers… (first run may take a moment)"):
             try:
-                store, client = get_index()
-            except FileNotFoundError as e:
+                store, embedder, openai_client = get_index(provider, effective_key)
+            except EnvironmentError as e:
                 st.error(str(e))
                 st.stop()
-            except EnvironmentError as e:
+            except FileNotFoundError as e:
                 st.error(str(e))
                 st.stop()
             except Exception as e:
                 err = str(e)
-                if "connect" in err.lower() or "connection" in err.lower() or "network" in err.lower():
+                if any(w in err.lower() for w in ("connect", "network", "timeout")):
                     st.error(
-                        f"**Connection error while calling the OpenAI API.**\n\n"
+                        f"**Connection error contacting the OpenAI API.**\n\n"
                         f"`{err}`\n\n"
-                        "**Things to check:**\n"
-                        "- Is your machine connected to the internet?\n"
-                        "- Is the OpenAI API key valid and active?\n"
-                        "- Is `api.openai.com` reachable from this network (no firewall/proxy blocking it)?\n"
-                        "- Try: `curl https://api.openai.com` in a terminal to verify."
+                        "Switch to **Local / Offline** mode in the sidebar to "
+                        "run without internet access."
                     )
                 else:
                     st.error(f"Failed to build the index: {e}")
                 st.stop()
 
-        with st.spinner("Generating answer…"):
+        with st.spinner("Retrieving passages and generating answer…"):
             try:
-                result: RAGAnswer = answer_question(question, store, client, top_k=top_k)
+                result: RAGAnswer = answer_question(
+                    question, store, embedder, openai_client, top_k=top_k
+                )
             except Exception as e:
                 st.error(f"Error generating answer: {e}")
                 st.stop()
 
         # ----------------------------------------------------------------
-        # Display: Answer
+        # Answer
         # ----------------------------------------------------------------
         st.markdown("## Answer")
         st.markdown(result.answer)
 
         # ----------------------------------------------------------------
-        # Display: Sources
+        # Sources
         # ----------------------------------------------------------------
         st.markdown("---")
         st.markdown("## Sources used")
@@ -155,20 +214,17 @@ if ask_button:
         else:
             for i, retrieved in enumerate(result.sources, start=1):
                 chunk = retrieved.chunk
-                similarity_pct = f"{retrieved.score * 100:.1f}%"
+                relevance = f"{retrieved.score * 100:.1f}%"
 
                 with st.expander(
-                    f"Source {i} — {chunk.source}  (page {chunk.page}, relevance {similarity_pct})",
+                    f"Source {i} — {chunk.source}  (page {chunk.page}, relevance {relevance})",
                     expanded=True,
                 ):
                     st.markdown(f"**Paper:** `{chunk.source}`")
                     st.markdown(f"**Page:** {chunk.page}")
-                    st.markdown(f"**Relevance score:** {similarity_pct}")
+                    st.markdown(f"**Relevance score:** {relevance}")
                     st.markdown("**Excerpt:**")
-                    # Show at most 600 chars for readability
-                    excerpt = chunk.text[:600]
-                    if len(chunk.text) > 600:
-                        excerpt += "…"
+                    excerpt = chunk.text[:600] + ("…" if len(chunk.text) > 600 else "")
                     st.markdown(f"> {excerpt}")
 
 # ---------------------------------------------------------------------------
@@ -176,6 +232,8 @@ if ask_button:
 # ---------------------------------------------------------------------------
 st.markdown("---")
 st.caption(
-    "Built with Streamlit · LangChain-free RAG · FAISS · OpenAI · PyPDF  |  "
+    "Built with Streamlit · FAISS · PyPDF  |  "
+    "Cloud mode: OpenAI embeddings + GPT-4o-mini  |  "
+    "Offline mode: sentence-transformers all-MiniLM-L6-v2  |  "
     "Drop PDFs into `papers/` and refresh to re-index."
 )
