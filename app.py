@@ -13,8 +13,9 @@ Run with:
 
 import os
 from pathlib import Path
-
+import httpx
 import streamlit as st
+
 from openai import OpenAI
 
 from rag_pipeline import (
@@ -52,7 +53,7 @@ def get_index(provider: str, api_key: str) -> tuple[VectorStore, Embedder, OpenA
             raise EnvironmentError(
                 "Please enter your OpenAI API key in the sidebar."
             )
-        client = OpenAI(api_key=api_key, timeout=60, max_retries=0)
+        client = OpenAI(api_key=api_key, timeout=60, max_retries=0, http_client=httpx.Client(verify=False))
         embedder: Embedder = OpenAIEmbedder(client)
         store = build_index(embedder)
         return store, embedder, client
